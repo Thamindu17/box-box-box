@@ -63,6 +63,50 @@ trap "rm -rf $TMP_DIR" EXIT
 echo -e "${BLUE}Running tests...${NC}"
 echo ""
 
+# jq is optional; fall back to Python for JSON parsing when jq is unavailable.
+HAS_JQ=false
+if command -v jq >/dev/null 2>&1; then
+    HAS_JQ=true
+fi
+
+json_is_valid() {
+    local file="$1"
+    if [ "$HAS_JQ" = true ]; then
+        jq empty "$file" >/dev/null 2>&1
+        return $?
+    fi
+
+    python - "$file" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    json.load(f)
+PY
+}
+
+extract_positions() {
+    local file="$1"
+    if [ "$HAS_JQ" = true ]; then
+        jq -r '.finishing_positions | join(",")' "$file" 2>/dev/null
+        return
+    fi
+
+    python - "$file" <<'PY' 2>/dev/null
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+positions = data.get("finishing_positions")
+if isinstance(positions, list):
+    print(",".join(str(x) for x in positions))
+else:
+    print("null")
+PY
+}
+
 # Check if we have expected outputs (for local testing)
 HAS_ANSWERS=false
 if [ -d "$EXPECTED_OUTPUTS_DIR" ]; then
@@ -80,39 +124,39 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
 
     if cat "$TEST_FILE" | eval "$SOLUTION_CMD" > "$OUTPUT_FILE" 2> "$ERROR_FILE"; then
         # Check if output is valid JSON
-        if jq empty "$OUTPUT_FILE" 2>/dev/null; then
+        if json_is_valid "$OUTPUT_FILE"; then
             # Extract finishing positions from output
-            PREDICTED=$(jq -r '.finishing_positions | join(",")' "$OUTPUT_FILE" 2>/dev/null)
+            PREDICTED=$(extract_positions "$OUTPUT_FILE")
 
             if [ -z "$PREDICTED" ] || [ "$PREDICTED" == "null" ]; then
                 echo -e "${RED}✗${NC} $TEST_ID - Invalid output format"
-                ((FAILED++))
+                FAILED=$((FAILED + 1))
             elif [ "$HAS_ANSWERS" = true ]; then
                 # Compare with expected output if we have answers
                 ANSWER_FILE="$EXPECTED_OUTPUTS_DIR/${TEST_NAME}.json"
                 if [ -f "$ANSWER_FILE" ]; then
-                    EXPECTED=$(jq -r '.finishing_positions | join(",")' "$ANSWER_FILE" 2>/dev/null)
+                    EXPECTED=$(extract_positions "$ANSWER_FILE")
 
                     if [ "$PREDICTED" == "$EXPECTED" ]; then
                         echo -e "${GREEN}✓${NC} $TEST_ID"
-                        ((PASSED++))
+                        PASSED=$((PASSED + 1))
                     else
                         echo -e "${RED}✗${NC} $TEST_ID - Incorrect prediction"
-                        ((FAILED++))
+                        FAILED=$((FAILED + 1))
                     fi
                 else
                     # No answer file for this test
                     echo -e "${YELLOW}?${NC} $TEST_ID - Output generated (no answer file found)"
-                    ((PASSED++))
+                    PASSED=$((PASSED + 1))
                 fi
             else
                 # No answer key, just check format
                 echo -e "${YELLOW}?${NC} $TEST_ID - Output generated (no answer key to verify)"
-                ((PASSED++))
+                PASSED=$((PASSED + 1))
             fi
         else
             echo -e "${RED}✗${NC} $TEST_ID - Invalid JSON output"
-            ((FAILED++))
+            FAILED=$((FAILED + 1))
         fi
     else
         # Execution error
@@ -120,7 +164,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
         if [ -s "$ERROR_FILE" ]; then
             echo -e "  ${RED}Error:${NC} $(head -n 1 "$ERROR_FILE")"
         fi
-        ((ERRORS++))
+        ERRORS=$((ERRORS + 1))
     fi
 done
 
@@ -133,7 +177,18 @@ echo ""
 # Calculate stats
 PASS_RATE=0
 if [ $TOTAL_TESTS -gt 0 ]; then
-    PASS_RATE=$(echo "scale=1; $PASSED * 100 / $TOTAL_TESTS" | bc)
+    if command -v bc >/dev/null 2>&1; then
+        PASS_RATE=$(echo "scale=1; $PASSED * 100 / $TOTAL_TESTS" | bc)
+    else
+        PASS_RATE=$(python - "$PASSED" "$TOTAL_TESTS" <<'PY'
+import sys
+
+passed = int(sys.argv[1])
+total = int(sys.argv[2])
+print(f"{(passed * 100.0 / total):.1f}")
+PY
+)
+    fi
 fi
 
 echo -e "Total Tests:    ${YELLOW}$TOTAL_TESTS${NC}"
