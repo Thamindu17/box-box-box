@@ -13,9 +13,6 @@ def main():
     correct = 0
     wrong_list = []
     
-    # Use 'python' on Windows, 'python3' on Unix
-    python_cmd = "python" if sys.platform == "win32" else "python3"
-    
     for i in range(1, 101):
         fn = f"test_{i:03d}.json"
         inp = f"data/test_cases/inputs/{fn}"
@@ -27,7 +24,7 @@ def main():
             expected = json.load(f)
         
         result = subprocess.run(
-            [python_cmd, "solution/race_simulator.py"],
+            [sys.executable, "solution/race_simulator.py"],
             input=input_data, capture_output=True, text=True
         )
         

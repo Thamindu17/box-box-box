@@ -1,16 +1,21 @@
 #!/usr/bin/env python
 import json, sys
+
 try:
     import numpy as np
 except Exception:
     np = None
 
 # Paste from optimize_power_model.py output:
-OFFSET = {'SOFT': -1.0387912967, 'MEDIUM': 0.0, 'HARD': 0.8279298538}
-BASE_DEG = {'SOFT': 0.7708620013, 'MEDIUM': 0.3912977471, 'HARD': 0.1910872173}
-CLIFF = {'SOFT': 9.982513, 'MEDIUM': 20.021992, 'HARD': 29.862884}
-TEMP_COEFF = 0.0427482786
-DEG_EXP = 1.0115024053
+OFFSET = {'SOFT': -1.0387912967, 'MEDIUM': 0.0, 'HARD': 0.8232843342503486}
+BASE_DEG = {'SOFT': 0.7708620013, 'MEDIUM': 0.39195342015625007, 'HARD': 0.19213575169747554}
+CLIFF = {'SOFT': 9.982513, 'MEDIUM': 20.010639644561927, 'HARD': 29.862884}
+TEMP_OFFSET_COEFF = {
+    'SOFT': -0.00016469619917818998,
+    'MEDIUM': -0.0034208415942521752,
+    'HARD': -0.004159703123025948,
+}
+TEMP_COEFF = 0.04323067877865523
 
 COMPOUND_TO_IDX = {"SOFT": 0, "MEDIUM": 1, "HARD": 2}
 
@@ -33,14 +38,23 @@ def simulate_race(test_case):
     base = float(cfg["base_lap_time"])
     pit = float(cfg["pit_lane_time"])
     temp = float(cfg["track_temp"])
+    dt = temp - 30.0
 
     if np is not None:
-        offsets = np.array([OFFSET["SOFT"], 0.0, OFFSET["HARD"]], dtype=np.float64)
+        offsets = np.array([
+            OFFSET["SOFT"] + TEMP_OFFSET_COEFF["SOFT"] * dt,
+            0.0 + TEMP_OFFSET_COEFF["MEDIUM"] * dt,
+            OFFSET["HARD"] + TEMP_OFFSET_COEFF["HARD"] * dt,
+        ], dtype=np.float64)
         base_deg = np.array([BASE_DEG["SOFT"], BASE_DEG["MEDIUM"], BASE_DEG["HARD"]], dtype=np.float64)
         cliffs = np.array([CLIFF["SOFT"], CLIFF["MEDIUM"], CLIFF["HARD"]], dtype=np.float64)
         eff_deg = base_deg * (1.0 + TEMP_COEFF * temp)
     else:
-        offsets = [OFFSET["SOFT"], 0.0, OFFSET["HARD"]]
+        offsets = [
+            OFFSET["SOFT"] + TEMP_OFFSET_COEFF["SOFT"] * dt,
+            0.0 + TEMP_OFFSET_COEFF["MEDIUM"] * dt,
+            OFFSET["HARD"] + TEMP_OFFSET_COEFF["HARD"] * dt,
+        ]
         base_deg = [BASE_DEG["SOFT"], BASE_DEG["MEDIUM"], BASE_DEG["HARD"]]
         cliffs = [CLIFF["SOFT"], CLIFF["MEDIUM"], CLIFF["HARD"]]
         eff_deg = [d * (1.0 + TEMP_COEFF * temp) for d in base_deg]
@@ -59,7 +73,7 @@ def simulate_race(test_case):
             ages = np.arange(1, maxL + 1, dtype=np.float64)
             prefix = np.zeros((3, maxL), dtype=np.float64)
             for comp in range(3):
-                f = np.maximum(0.0, ages - cliffs[comp]) ** DEG_EXP
+                f = np.maximum(0.0, ages - cliffs[comp])
                 prefix[comp] = np.cumsum(f)
         else:
             prefix = [[0.0] * (maxL + 1) for _ in range(3)]
@@ -69,7 +83,7 @@ def simulate_race(test_case):
                 for age in range(1, maxL + 1):
                     lp = age - cliff
                     if lp > 0.0:
-                        total += lp ** DEG_EXP
+                        total += lp
                     prefix[comp][age] = total
 
         tt = nstops * pit
@@ -95,7 +109,7 @@ def main():
         test_case = json.loads(data)
         out = {
             "race_id": test_case.get("race_id", ""),
-            "finishing_positions": simulate_race(test_case)
+            "finishing_positions": simulate_race(test_case),
         }
         sys.stdout.write(json.dumps(out) + "\n")
     except Exception as exc:
