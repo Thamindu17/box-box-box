@@ -1,65 +1,120 @@
 #!/usr/bin/env python
 import json, sys
 
-# DETERMINISTIC GAME CONSTANTS (Derived from Historical Data)
-# These represent the exact speed and wear offsets built into the game engine.
-OFFSET = {'SOFT': -1.1, 'MEDIUM': 0.0, 'HARD': 0.9}
-BASE_DEG = {'SOFT': 0.12, 'MEDIUM': 0.05, 'HARD': 0.02}
-CLIFF = {'SOFT': 10, 'MEDIUM': 20, 'HARD': 30}
+try:
+    import numpy as np
+except Exception:
+    np = None
 
-# The true scaling model used in the 10k race set:
-TEMP_COEFF = 0.02
-TEMP_PIVOT = 25.0
+# Paste from optimize_power_model.py output:
+OFFSET = {'SOFT': -1.0387912967, 'MEDIUM': 0.0, 'HARD': 0.8232843342503486}
+BASE_DEG = {'SOFT': 0.7708620013, 'MEDIUM': 0.39195342015625007, 'HARD': 0.19213575169747554}
+CLIFF = {'SOFT': 9.982513, 'MEDIUM': 20.010639644561927, 'HARD': 29.862884}
+TEMP_OFFSET_COEFF = {
+    'SOFT': -0.00016469619917818998,
+    'MEDIUM': -0.0034208415942521752,
+    'HARD': -0.004159703123025948,
+}
+TEMP_COEFF = 0.04323067877865523
 
-def simulate_race(tc):
-    cfg = tc["race_config"]
-    laps, base, pit, temp = int(cfg["total_laps"]), float(cfg["base_lap_time"]), float(cfg["pit_lane_time"]), float(cfg["track_temp"])
+COMPOUND_TO_IDX = {"SOFT": 0, "MEDIUM": 1, "HARD": 2}
+
+def build_stints(strategy, total_laps):
+    pits = sorted(strategy.get("pit_stops", []), key=lambda p: int(p["lap"]))
+    stints = []
+    cur = strategy["starting_tire"]
+    start = 1
+    for p in pits:
+        lap = int(p["lap"])
+        stints.append((COMPOUND_TO_IDX[cur], lap - start + 1))
+        cur = p["to_tire"]
+        start = lap + 1
+    stints.append((COMPOUND_TO_IDX[cur], total_laps - start + 1))
+    return stints, len(pits)
+
+def simulate_race(test_case):
+    cfg = test_case["race_config"]
+    total_laps = int(cfg["total_laps"])
+    base = float(cfg["base_lap_time"])
+    pit = float(cfg["pit_lane_time"])
+    temp = float(cfg["track_temp"])
+    dt = temp - 30.0
+
+    if np is not None:
+        offsets = np.array([
+            OFFSET["SOFT"] + TEMP_OFFSET_COEFF["SOFT"] * dt,
+            0.0 + TEMP_OFFSET_COEFF["MEDIUM"] * dt,
+            OFFSET["HARD"] + TEMP_OFFSET_COEFF["HARD"] * dt,
+        ], dtype=np.float64)
+        base_deg = np.array([BASE_DEG["SOFT"], BASE_DEG["MEDIUM"], BASE_DEG["HARD"]], dtype=np.float64)
+        cliffs = np.array([CLIFF["SOFT"], CLIFF["MEDIUM"], CLIFF["HARD"]], dtype=np.float64)
+        eff_deg = base_deg * (1.0 + TEMP_COEFF * temp)
+    else:
+        offsets = [
+            OFFSET["SOFT"] + TEMP_OFFSET_COEFF["SOFT"] * dt,
+            0.0 + TEMP_OFFSET_COEFF["MEDIUM"] * dt,
+            OFFSET["HARD"] + TEMP_OFFSET_COEFF["HARD"] * dt,
+        ]
+        base_deg = [BASE_DEG["SOFT"], BASE_DEG["MEDIUM"], BASE_DEG["HARD"]]
+        cliffs = [CLIFF["SOFT"], CLIFF["MEDIUM"], CLIFF["HARD"]]
+        eff_deg = [d * (1.0 + TEMP_COEFF * temp) for d in base_deg]
 
     results = []
-    # Grid position (1-20) is the mandatory tie-breaker
-    for grid_idx in range(1, 21):
-        strat = tc["strategies"][f"pos{grid_idx}"]
-        did = strat["driver_id"]
-        
-        # Parse stints: (compound, start_lap, end_lap)
-        pits = sorted(strat.get("pit_stops", []), key=lambda p: int(p["lap"]))
-        current_tire, age, total_time = strat["starting_tire"], 0, 0.0
-        pit_laps = {int(p["lap"]): p["to_tire"] for p in pits}
 
-        for lap in range(1, laps + 1):
-            # 1. Age increments BEFORE calculation (Regulation Requirement)
-            age += 1
-            
-            # 2. Calculate Lap Penalty
-            # Multiplier centers on 25C (Pivot)
-            temp_mult = 1.0 + (TEMP_COEFF * (temp - TEMP_PIVOT))
-            eff_deg = BASE_DEG[current_tire] * temp_mult
-            
-            # Linear penalty applied lap-by-lap (effectively cumulative over the stint)
-            lap_penalty = max(0, age - CLIFF[current_tire]) * eff_deg
-            
-            # 3. Sum total time
-            total_time += base + OFFSET[current_tire] + lap_penalty
-            
-            # 4. Handle Pit Stop at the end of the lap
-            if lap in pit_laps:
-                total_time += pit
-                current_tire = pit_laps[lap]
-                age = 0
-        
-        # Store results with grid_idx for stable sorting
-        results.append((total_time, grid_idx, did))
+    for grid in range(1, 21):
+        strat = test_case["strategies"][f"pos{grid}"]
+        did = strat["driver_id"]
+
+        stints, nstops = build_stints(strat, total_laps)
+
+        maxL = max(L for _, L in stints if L > 0)
+
+        if np is not None:
+            ages = np.arange(1, maxL + 1, dtype=np.float64)
+            prefix = np.zeros((3, maxL), dtype=np.float64)
+            for comp in range(3):
+                f = np.maximum(0.0, ages - cliffs[comp])
+                prefix[comp] = np.cumsum(f)
+        else:
+            prefix = [[0.0] * (maxL + 1) for _ in range(3)]
+            for comp in range(3):
+                total = 0.0
+                cliff = cliffs[comp]
+                for age in range(1, maxL + 1):
+                    lp = age - cliff
+                    if lp > 0.0:
+                        total += lp
+                    prefix[comp][age] = total
+
+        tt = nstops * pit
+        for comp, L in stints:
+            if L <= 0:
+                continue
+            if np is not None:
+                tt += L * (base + offsets[comp]) + eff_deg[comp] * prefix[comp, L - 1]
+            else:
+                tt += L * (base + offsets[comp]) + eff_deg[comp] * prefix[comp][L]
+
+        # Use driver_id only as deterministic tie-break for equal total times.
+        results.append((tt, did))
 
     results.sort()
-    return [r[2] for r in results]
+    return [r[1] for r in results]
 
 def main():
     try:
         data = sys.stdin.read()
-        if not data.strip(): return
-        tc = json.loads(data)
-        out = {"race_id": tc.get("race_id", ""), "finishing_positions": simulate_race(tc)}
+        if not data.strip():
+            return
+        test_case = json.loads(data)
+        out = {
+            "race_id": test_case.get("race_id", ""),
+            "finishing_positions": simulate_race(test_case),
+        }
         sys.stdout.write(json.dumps(out) + "\n")
-    except Exception: pass
+    except Exception as exc:
+        sys.stderr.write(f"race_simulator error: {exc}\n")
+        sys.exit(1)
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
